@@ -4,13 +4,15 @@ Create an MP4 from one image and one audio file using GitHub Actions + FFmpeg.
 
 ## Before running
 
-1. Upload your image to the repository's root folder and name it exactly `image.jpg` (the file can contain JPG, PNG, or another ImageMagick-supported image format).
+1. Upload an image file (for example, `1.png`) to the repository's **root folder**. You can use different filenames for future images; do not rename it to `image.jpg`.
 2. Open **Actions** → **Build video from image + audio**.
 3. Click **Run workflow**.
 4. Fill in only these two fields:
    - **Audio URL**: a direct-download link to the audio file.
    - **Video resolution**: 360p, 480p, 720p, or 1080p.
-5. Start the workflow. When it finishes, download `output-video` from the run's **Artifacts** section.
+5. Start the workflow. It automatically uses the most recently committed image in the repository root. When it finishes, download `output-video` from the run's **Artifacts** section.
+
+Supported image formats include PNG, JPG/JPEG, WebP, BMP, GIF, and TIFF. Keep images in the repository root (not inside a folder). If there are several images, the workflow selects the one with the most recent commit.
 
 ## Resolution mapping
 
