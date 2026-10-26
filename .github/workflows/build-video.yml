@@ -33,23 +33,50 @@ jobs:
     outputs:
       audio_duration: ${{ steps.validate.outputs.audio_duration }}
     steps:
-      - name: Check out repository (includes uploaded image)
+      - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Find and validate uploaded image
+      - name: Automatically find the latest uploaded image
         run: |
           set -euo pipefail
-          if [ ! -s image.jpg ]; then
-            echo "::error::Upload your image to the repository root and name it image.jpg before running this workflow."
-            exit 1
-          fi
-          file image.jpg
-          if ! identify image.jpg >/dev/null 2>&1; then
+          python - <<'PY'
+          import pathlib
+          import subprocess
+
+          allowed = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+          candidates = [
+              p for p in pathlib.Path(".").iterdir()
+              if p.is_file() and p.suffix.lower() in allowed
+          ]
+          if not candidates:
+              raise SystemExit(
+                  "::error::No image found in the repository root. Upload an image file (PNG, JPG, WebP, etc.) and run again."
+              )
+
+          def last_changed(path):
+              result = subprocess.run(
+                  ["git", "log", "-1", "--format=%ct", "--", path.name],
+                  check=True, capture_output=True, text=True
+              )
+              return int(result.stdout.strip() or "0")
+
+          candidates.sort(key=lambda p: (last_changed(p), p.name), reverse=True)
+          chosen = candidates[0]
+          print(f"Using latest uploaded image: {chosen.name}")
+          with open("selected-image.txt", "w", encoding="utf-8") as f:
+              f.write(chosen.name)
+          PY
+          image_name="$(cat selected-image.txt)"
+          file "$image_name"
+          if ! identify "$image_name" >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y imagemagick
           fi
-          identify image.jpg >/dev/null
-          echo "Image validated."
+          identify "$image_name" >/dev/null
+          cp "$image_name" input-image
+          test -s input-image
 
       - name: Install FFmpeg
         run: |
