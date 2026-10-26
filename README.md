@@ -1,31 +1,32 @@
 # Image + Audio to Video
 
-Create an MP4 from one still image and one audio file using GitHub Actions + FFmpeg.
+Create an MP4 from one image and one audio file using GitHub Actions + FFmpeg.
 
-## Run it
+## Before running
 
-1. Open **Actions** → **Build video from image + audio**.
-2. Choose **Run workflow**.
-3. Paste direct-download URLs for the image and audio.
-4. Choose resolution and FPS, then start the run.
-5. Download `output-video` from the completed run's Artifacts section.
+1. Upload your image to the repository's root folder and name it exactly `image.jpg` (the file can contain JPG, PNG, or another ImageMagick-supported image format).
+2. Open **Actions** → **Build video from image + audio**.
+3. Click **Run workflow**.
+4. Fill in only these two fields:
+   - **Audio URL**: a direct-download link to the audio file.
+   - **Video resolution**: 360p, 480p, 720p, or 1080p.
+5. Start the workflow. When it finishes, download `output-video` from the run's **Artifacts** section.
 
-## Inputs
+## Resolution mapping
 
-- `image_url`: direct URL to a single image.
-- `audio_url`: direct URL to an audio file (MP3, WAV, M4A, AAC, etc.).
-- `resolution`: `1920x1080`, `1280x720`, or `1080x1920`.
-- `fps`: 24, 30, or 60.
+- 360p: 640×360
+- 480p: 854×480
+- 720p: 1280×720
+- 1080p: 1920×1080
 
-The URLs must be accessible without logging in and should return the actual media bytes, not an HTML preview page. Dropbox shared links can sometimes be converted by adding `dl=1`; test that the server actually returns the full file.
+The video uses 30 FPS automatically. Its duration follows the audio duration. The image is scaled to fit while preserving aspect ratio; any remaining space is black.
 
-## Validation
+## Audio link requirements
 
-The workflow checks HTTP status, downloaded file size, image decoding, audio decoding, and audio duration. It fails instead of silently creating a tiny video if the server returns an incomplete audio file.
+The URL must be accessible without signing in and should return the actual audio file, not an HTML preview page. Dropbox shared links may need `dl=1`; verify that the link downloads the complete file.
 
-## Notes
+The workflow checks the downloaded audio's file size, duration, and decodability. It stops with an error instead of producing a misleading short video if the host returns an incomplete file.
 
-- Output video duration follows the audio duration.
-- Image is scaled to fit the selected frame while preserving aspect ratio; remaining space is black.
-- This repo does not store your input media in Git.
-- GitHub Actions run time and artifact retention are subject to your GitHub plan and repository settings.
+## Note
+
+The image is stored in the repository when you upload it, so only upload an image you're comfortable keeping there. GitHub Actions artifacts are retained for 7 days.
