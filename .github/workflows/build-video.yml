@@ -3,32 +3,20 @@ name: Build video from image + audio
 on:
   workflow_dispatch:
     inputs:
-      image_url:
-        description: "Direct-download URL for the image"
-        required: true
-        type: string
       audio_url:
         description: "Direct-download URL for the audio"
         required: true
         type: string
       resolution:
-        description: "Output resolution"
+        description: "Video resolution"
         required: true
         type: choice
         options:
-          - 1920x1080
-          - 1280x720
-          - 1080x1920
-        default: 1920x1080
-      fps:
-        description: "Frames per second"
-        required: true
-        type: choice
-        options:
-          - "24"
-          - "30"
-          - "60"
-        default: "30"
+          - 360p
+          - 480p
+          - 720p
+          - 1080p
+        default: 720p
 
 permissions:
   contents: read
@@ -39,29 +27,29 @@ concurrency:
 
 jobs:
   download-and-validate:
-    name: Download and validate inputs
+    name: Validate image and download audio
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       audio_duration: ${{ steps.validate.outputs.audio_duration }}
     steps:
-      - name: Download image
-        env:
-          MEDIA_URL: ${{ inputs.image_url }}
+      - name: Check out repository (includes uploaded image)
+        uses: actions/checkout@v4
+
+      - name: Find and validate uploaded image
         run: |
           set -euo pipefail
-          curl --fail --location --silent --show-error \
-            --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 \
-            "$MEDIA_URL" -o input-image
-          test -s input-image
-          echo "Image downloaded: $(stat -c%s input-image) bytes"
-          file input-image
-          if ! identify input-image >/dev/null 2>&1; then
+          if [ ! -s image.jpg ]; then
+            echo "::error::Upload your image to the repository root and name it image.jpg before running this workflow."
+            exit 1
+          fi
+          file image.jpg
+          if ! identify image.jpg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y imagemagick
-            identify input-image
           fi
-          identify input-image >/dev/null
+          identify image.jpg >/dev/null
+          echo "Image validated."
 
       - name: Install FFmpeg
         run: |
@@ -79,13 +67,11 @@ jobs:
           test -s input-audio
           echo "Audio downloaded: $(stat -c%s input-audio) bytes"
           file input-audio
-          # Reject suspiciously tiny files before FFprobe/FFmpeg processing.
           if [ "$(stat -c%s input-audio)" -lt 16384 ]; then
             echo "::error::Downloaded audio is under 16 KiB. The URL may be a preview/error response or an incomplete file."
             exit 1
           fi
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio > audio-duration.txt
-          duration="$(cat audio-duration.txt)"
+          duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio)"
           python - "$duration" <<'PY'
           import sys
           try:
@@ -98,18 +84,15 @@ jobs:
           PY
           ffmpeg -v error -i input-audio -f null -
 
-      - name: Validate image and publish duration
+      - name: Prepare validated inputs
         id: validate
         run: |
           set -euo pipefail
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio
           duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio)"
           echo "audio_duration=$duration" >> "$GITHUB_OUTPUT"
-          identify input-image
           mkdir -p validated
-          cp input-image validated/input-image
+          cp image.jpg validated/input-image
           cp input-audio validated/input-audio
-          cp audio-duration.txt validated/audio-duration.txt
 
       - name: Upload validated inputs
         uses: actions/upload-artifact@v4
@@ -125,10 +108,10 @@ jobs:
     needs: download-and-validate
     timeout-minutes: 180
     steps:
-      - name: Install FFmpeg and ImageMagick
+      - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg imagemagick
+          sudo apt-get install -y ffmpeg
 
       - name: Download validated inputs
         uses: actions/download-artifact@v4
@@ -139,19 +122,24 @@ jobs:
       - name: Render video
         env:
           RESOLUTION: ${{ inputs.resolution }}
-          FPS: ${{ inputs.fps }}
         run: |
           set -euo pipefail
-          IFS=x read -r WIDTH HEIGHT <<< "$RESOLUTION"
+          case "$RESOLUTION" in
+            360p) WIDTH=640; HEIGHT=360 ;;
+            480p) WIDTH=854; HEIGHT=480 ;;
+            720p) WIDTH=1280; HEIGHT=720 ;;
+            1080p) WIDTH=1920; HEIGHT=1080 ;;
+            *) echo "::error::Unsupported resolution: $RESOLUTION"; exit 1 ;;
+          esac
           test -s media/input-image
           test -s media/input-audio
           duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 media/input-audio)"
-          echo "Rendering at ${WIDTH}x${HEIGHT}, ${FPS} fps, audio duration ${duration}s"
+          echo "Rendering at ${WIDTH}x${HEIGHT}, 30 fps, audio duration ${duration}s"
           ffmpeg -hide_banner -y \
-            -loop 1 -framerate "$FPS" -i media/input-image \
+            -loop 1 -framerate 30 -i media/input-image \
             -i media/input-audio \
             -map 0:v:0 -map 1:a:0 \
-            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${FPS},format=yuv420p" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p" \
             -c:v libx264 -preset veryfast -crf 23 \
             -c:a aac -b:a 192k \
             -t "$duration" -movflags +faststart output.mp4
