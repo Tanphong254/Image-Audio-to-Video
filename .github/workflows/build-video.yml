@@ -118,7 +118,7 @@ jobs:
           duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio)"
           echo "audio_duration=$duration" >> "$GITHUB_OUTPUT"
           mkdir -p validated
-          cp image.jpg validated/input-image
+          cp input-image validated/input-image
           cp input-audio validated/input-audio
 
       - name: Upload validated inputs
