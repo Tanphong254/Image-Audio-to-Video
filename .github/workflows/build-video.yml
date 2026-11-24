@@ -19,6 +19,7 @@ on:
         default: 720p
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -26,19 +27,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  download-and-validate:
-    name: Validate image and download audio
+  prepare:
+    name: Split audio into 30-minute chunks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     outputs:
-      audio_duration: ${{ steps.validate.outputs.audio_duration }}
+      audio_duration: ${{ steps.prepare.outputs.audio_duration }}
+      chunk_count: ${{ steps.prepare.outputs.chunk_count }}
+      render_matrix: ${{ steps.prepare.outputs.render_matrix }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Download validated media from the previous 17-hour run
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-media
+          path: previous-media
+          repository: harrytheanh254/Image-Audio-to-Video
+          run-id: 41989669636
+          github-token: ${{ github.token }}
+
+      - name: Restore source media from the previous run
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          test -s previous-media/input-audio
+          test -s previous-media/input-image
+          cp previous-media/input-audio input-audio
+          cp previous-media/input-image input-image
+          echo "Reusing the exact validated audio and image from run 41989669636."
+
       - name: Automatically find the latest uploaded image
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -84,6 +108,7 @@ jobs:
           sudo apt-get install -y ffmpeg
 
       - name: Download audio
+        if: github.event_name == 'workflow_dispatch'
         env:
           MEDIA_URL: ${{ inputs.audio_url }}
         run: |
@@ -98,6 +123,12 @@ jobs:
             echo "::error::Downloaded audio is under 16 KiB. The URL may be a preview/error response or an incomplete file."
             exit 1
           fi
+
+      - name: Validate and split audio
+        id: prepare
+        run: |
+          set -euo pipefail
+
           duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio)"
           python - "$duration" <<'PY'
           import sys
@@ -106,49 +137,214 @@ jobs:
           except Exception:
               raise SystemExit("Could not read audio duration")
           if d <= 1:
-              raise SystemExit(f"Audio duration {d:.3f}s is too short; refusing to create a misleading video.")
+              raise SystemExit(f"Audio duration {d:.3f}s is too short.")
           print(f"Audio duration: {d:.3f} seconds ({d/60:.2f} minutes)")
           PY
+
+          # Fully decode once to reject broken or incomplete downloads.
           ffmpeg -v error -i input-audio -f null -
 
-      - name: Prepare validated inputs
-        id: validate
-        run: |
-          set -euo pipefail
-          duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input-audio)"
-          echo "audio_duration=$duration" >> "$GITHUB_OUTPUT"
-          mkdir -p validated
-          cp input-image validated/input-image
-          cp input-audio validated/input-audio
+          mkdir -p chunks
+          codec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 input-audio | head -n 1)"
+          echo "Source audio codec: $codec"
 
-      - name: Upload validated inputs
+          # MP3 is split with stream copy to preserve its original audio quality.
+          # Other audio formats are converted to AAC chunks for reliable MP4 rendering.
+          if [ "$codec" = "mp3" ]; then
+            ffmpeg -hide_banner -loglevel error -y \
+              -i input-audio -map 0:a:0 -vn -c:a copy \
+              -f segment -segment_time 1800 -reset_timestamps 1 \
+              chunks/chunk_%03d.mp3
+          else
+            ffmpeg -hide_banner -loglevel error -y \
+              -i input-audio -map 0:a:0 -vn -c:a aac -b:a 96k \
+              -f segment -segment_time 1800 -reset_timestamps 1 \
+              -segment_format mp4 chunks/chunk_%03d.m4a
+          fi
+
+          test -n "$(find chunks -maxdepth 1 -type f -name 'chunk_*' -print -quit)"
+          AUDIO_DURATION="$duration" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          files = sorted(Path("chunks").glob("chunk_*"))
+          if not files:
+              raise SystemExit("No audio chunks were created.")
+
+          render_items = [
+              {"id": f"{i:02d}", "file": p.name}
+              for i, p in enumerate(files, start=1)
+          ]
+
+          import shutil
+
+          # Bundle four 30-minute audio segments per artifact. Each render job
+          # downloads only its bundle, not the entire 17+ hour source audio.
+          group_root = Path("chunk-groups")
+          group_root.mkdir(exist_ok=True)
+          grouped_items = []
+          for i, source in enumerate(files, start=1):
+              group = f"{((i - 1) // 4) + 1:02d}"
+              target_dir = group_root / f"group-{group}"
+              target_dir.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, target_dir / source.name)
+              grouped_items.append({
+                  "id": f"{i:02d}",
+                  "file": source.name,
+                  "group": group,
+              })
+
+          group_count = (len(files) + 3) // 4
+          if group_count > 9:
+              raise SystemExit(
+                  f"This workflow currently supports up to 36 half-hour chunks (18 hours); found {len(files)} chunks."
+              )
+
+          outputs = {
+              "audio_duration": os.environ["AUDIO_DURATION"],
+              "chunk_count": str(len(files)),
+              "group_count": str(group_count),
+              "render_matrix": json.dumps({"include": grouped_items}, separators=(",", ":")),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              for key, value in outputs.items():
+                  f.write(f"{key}={value}\n")
+          print(f"Created {len(files)} audio chunks.")
+          print(f"Created {group_count} audio bundles, with at most four chunks in each.")
+          PY
+
+      - name: Upload audio bundle 01
+        if: fromJSON(steps.prepare.outputs.group_count) >= 1
         uses: actions/upload-artifact@v4
         with:
-          name: validated-media
-          path: validated/
+          name: audio-01
+          path: chunk-groups/group-01/
           if-no-files-found: error
           retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 02
+        if: fromJSON(steps.prepare.outputs.group_count) >= 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-02
+          path: chunk-groups/group-02/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 03
+        if: fromJSON(steps.prepare.outputs.group_count) >= 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-03
+          path: chunk-groups/group-03/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 04
+        if: fromJSON(steps.prepare.outputs.group_count) >= 4
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-04
+          path: chunk-groups/group-04/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 05
+        if: fromJSON(steps.prepare.outputs.group_count) >= 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-05
+          path: chunk-groups/group-05/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 06
+        if: fromJSON(steps.prepare.outputs.group_count) >= 6
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-06
+          path: chunk-groups/group-06/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 07
+        if: fromJSON(steps.prepare.outputs.group_count) >= 7
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-07
+          path: chunk-groups/group-07/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 08
+        if: fromJSON(steps.prepare.outputs.group_count) >= 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-08
+          path: chunk-groups/group-08/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload audio bundle 09
+        if: fromJSON(steps.prepare.outputs.group_count) >= 9
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-09
+          path: chunk-groups/group-09/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload image for render jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-image
+          path: input-image
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   render:
-    name: Render MP4
+    name: Video ${{ matrix.id }}
     runs-on: ubuntu-latest
-    needs: download-and-validate
-    timeout-minutes: 180
+    needs: prepare
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.render_matrix) }}
     steps:
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Download validated inputs
+      - name: Download image
         uses: actions/download-artifact@v4
         with:
-          name: validated-media
-          path: media
+          name: media-image
+          path: image
 
-      - name: Render video
+      - name: Download this audio bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: audio-${{ matrix.group }}
+          path: audio
+
+      - name: Render MP4 chunk
         env:
-          RESOLUTION: ${{ inputs.resolution }}
+          RESOLUTION: ${{ inputs.resolution || '720p' }}
+          AUDIO_FILE: ${{ matrix.file }}
+          CHUNK_ID: ${{ matrix.id }}
         run: |
           set -euo pipefail
           case "$RESOLUTION" in
@@ -158,30 +354,107 @@ jobs:
             1080p) WIDTH=1920; HEIGHT=1080 ;;
             *) echo "::error::Unsupported resolution: $RESOLUTION"; exit 1 ;;
           esac
-          test -s media/input-image
-          test -s media/input-audio
-          duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 media/input-audio)"
-          echo "Rendering at ${WIDTH}x${HEIGHT}, 30 fps, audio duration ${duration}s"
+
+          audio_path="audio/$AUDIO_FILE"
+          test -s image/input-image
+          test -s "$audio_path"
+          duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$audio_path")"
+          echo "Rendering Video $CHUNK_ID at $WIDTH x $HEIGHT, 24 fps, audio duration $duration seconds"
+
           ffmpeg -hide_banner -y \
-            -loop 1 -framerate 30 -i media/input-image \
-            -i media/input-audio \
+            -loop 1 -framerate 24 -i image/input-image \
+            -i "$audio_path" \
             -map 0:v:0 -map 1:a:0 \
-            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p" \
+            -vf "scale=$WIDTH:$HEIGHT:force_original_aspect_ratio=decrease,pad=$WIDTH:$HEIGHT:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=24,format=yuv420p" \
             -c:v libx264 -preset veryfast -crf 23 \
             -c:a aac -b:a 192k \
-            -t "$duration" -movflags +faststart output.mp4
-          test -s output.mp4
-          ffprobe -v error -show_entries format=duration:stream=codec_type,width,height -of json output.mp4 | tee output-info.json
-          video_duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 output.mp4)"
+            -t "$duration" -movflags +faststart "video-$CHUNK_ID.mp4"
+
+          test -s "video-$CHUNK_ID.mp4"
+          video_duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "video-$CHUNK_ID.mp4")"
           python - "$duration" "$video_duration" <<'PY'
           import sys
           src, out = map(float, sys.argv[1:3])
-          print(f"Source audio: {src:.3f}s; output video: {out:.3f}s")
+          print(f"Chunk audio: {src:.3f}s; chunk video: {out:.3f}s")
           if out < src * 0.98:
-              raise SystemExit("Output video is unexpectedly shorter than the source audio.")
+              raise SystemExit("Rendered chunk is unexpectedly shorter than its audio.")
           PY
 
-      - name: Upload MP4
+      - name: Upload this MP4 chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ matrix.id }}
+          path: video-${{ matrix.id }}.mp4
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  merge:
+    name: Merge all MP4 chunks
+    runs-on: ubuntu-latest
+    needs: [prepare, render]
+    timeout-minutes: 120
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download all rendered MP4 chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: video-*
+          path: rendered
+          merge-multiple: true
+
+      - name: Merge chunks in the correct order
+        env:
+          EXPECTED_CHUNKS: ${{ needs.prepare.outputs.chunk_count }}
+          EXPECTED_DURATION: ${{ needs.prepare.outputs.audio_duration }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path("rendered")
+          videos = list(root.glob("video-*.mp4"))
+          videos.sort(key=lambda p: int(re.search(r"video-(\d+)\.mp4$", p.name).group(1)))
+
+          expected = int(os.environ["EXPECTED_CHUNKS"])
+          if len(videos) != expected:
+              raise SystemExit(f"Expected {expected} MP4 chunks, found {len(videos)}.")
+
+          for index, video in enumerate(videos, start=1):
+              if video.name != f"video-{index:02d}.mp4":
+                  raise SystemExit(f"Missing or out-of-order chunk: expected video-{index:02d}.mp4")
+
+          with open("concat-list.txt", "w", encoding="utf-8") as f:
+              for video in videos:
+                  f.write(f"file '{video.resolve()}'\n")
+
+          print("Merge order:")
+          for video in videos:
+              print(f"  {video.name}")
+          PY
+
+          ffmpeg -hide_banner -y \
+            -f concat -safe 0 -i concat-list.txt \
+            -c copy -movflags +faststart output.mp4
+
+          test -s output.mp4
+          ffprobe -v error -show_entries format=duration:stream=codec_type,width,height -of json output.mp4 | tee output-info.json
+          output_duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 output.mp4)"
+          python - "$EXPECTED_DURATION" "$output_duration" <<'PY'
+          import sys
+          expected, actual = map(float, sys.argv[1:3])
+          print(f"Source audio: {expected:.3f}s; final video: {actual:.3f}s")
+          if actual < expected * 0.98:
+              raise SystemExit("Final video is unexpectedly shorter than the source audio.")
+          PY
+
+      - name: Upload final MP4
         uses: actions/upload-artifact@v4
         with:
           name: output-video
@@ -190,3 +463,4 @@ jobs:
             output-info.json
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
